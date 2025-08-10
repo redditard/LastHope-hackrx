@@ -35,6 +35,11 @@ class Settings:
     GEMINI_MAX_OUTPUT_TOKENS: int = 1000
     GEMINI_BATCH_SIZE: int = int(os.getenv("GEMINI_BATCH_SIZE", "10"))  # Questions per batch
     
+    # Targeted search settings
+    USE_TARGETED_SEARCH: bool = os.getenv("USE_TARGETED_SEARCH", "true").lower() == "true"
+    MAX_PAGES_PER_QUESTION: int = int(os.getenv("MAX_PAGES_PER_QUESTION", "3"))
+    LARGE_PDF_THRESHOLD: int = int(os.getenv("LARGE_PDF_THRESHOLD", "50000"))  # Character count threshold
+    
     # Logging configuration
     LOG_LEVEL: str = "INFO"  # DEBUG, INFO, WARNING, ERROR
     LOG_FILE: str = "api.log"

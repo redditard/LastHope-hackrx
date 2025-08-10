@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, HttpUrl
-from typing import List
+from typing import List, Dict, Any, Tuple, Set
 import requests
 import json
 import pdfplumber
@@ -11,6 +11,9 @@ import logging
 import threading
 from io import BytesIO
 from config import settings
+import re
+from collections import Counter
+import math
 
 # Validate configuration on startup
 settings.validate()
@@ -167,6 +170,300 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
             headers={"WWW-Authenticate": "Bearer"},
         )
     return credentials.credentials
+
+def extract_keywords_from_question(question: str) -> Set[str]:
+    """Extract meaningful keywords from a question for search."""
+    # Remove common question words and stopwords
+    stopwords = {
+        'what', 'where', 'when', 'why', 'how', 'who', 'which', 'whose', 'whom',
+        'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+        'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might',
+        'can', 'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to',
+        'for', 'of', 'with', 'by', 'from', 'about', 'into', 'through', 'during',
+        'before', 'after', 'above', 'below', 'up', 'down', 'out', 'off', 'over',
+        'under', 'again', 'further', 'then', 'once', 'here', 'there', 'all',
+        'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such',
+        'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very'
+    }
+    
+    # Clean and tokenize
+    text = re.sub(r'[^\w\s]', ' ', question.lower())
+    words = [word.strip() for word in text.split() if len(word.strip()) > 2]
+    
+    # Filter out stopwords and short words
+    keywords = {word for word in words if word not in stopwords and len(word) > 2}
+    
+    return keywords
+
+def calculate_page_relevance_score(page_text: str, keywords: Set[str]) -> float:
+    """Calculate relevance score for a page based on keyword presence."""
+    if not keywords or not page_text:
+        return 0.0
+    
+    # Convert to lowercase for matching
+    page_lower = page_text.lower()
+    
+    # Count keyword occurrences
+    keyword_counts = {}
+    total_matches = 0
+    
+    for keyword in keywords:
+        count = len(re.findall(r'\b' + re.escape(keyword) + r'\b', page_lower))
+        if count > 0:
+            keyword_counts[keyword] = count
+            total_matches += count
+    
+    # Calculate score based on:
+    # 1. Number of unique keywords found
+    # 2. Total frequency of keywords
+    # 3. Keyword density in the page
+    
+    unique_keywords_found = len(keyword_counts)
+    unique_keywords_ratio = unique_keywords_found / len(keywords)
+    
+    # Avoid division by zero
+    page_length = max(len(page_text.split()), 1)
+    keyword_density = total_matches / page_length
+    
+    # Weighted score combining different factors
+    score = (unique_keywords_ratio * 0.6) + (keyword_density * 0.4)
+    
+    return score
+
+def extract_pdf_with_page_indexing(pdf_url: str) -> Tuple[List[Dict], str]:
+    """
+    Download PDF and extract text with page indexing for targeted search.
+    Returns: (pages_data, full_text)
+    """
+    logger.info(f"Starting indexed PDF extraction from URL: {pdf_url}")
+    
+    try:
+        # Download the PDF
+        logger.info("Downloading PDF...")
+        response = requests.get(pdf_url, timeout=settings.PDF_DOWNLOAD_TIMEOUT)
+        logger.info(f"PDF download status: {response.status_code}")
+        response.raise_for_status()
+        
+        # Extract text with page indexing
+        logger.info("Extracting text with page indexing...")
+        pages_data = []
+        full_text = ""
+        
+        with pdfplumber.open(BytesIO(response.content)) as pdf:
+            total_pages = len(pdf.pages)
+            logger.info(f"PDF contains {total_pages} pages")
+            
+            for page_num, page in enumerate(pdf.pages, 1):
+                page_text = page.extract_text()
+                if page_text:
+                    page_data = {
+                        'page_number': page_num,
+                        'text': page_text,
+                        'char_count': len(page_text)
+                    }
+                    pages_data.append(page_data)
+                    full_text += page_text + "\n"
+                    logger.debug(f"Page {page_num}: extracted {len(page_text)} characters")
+                else:
+                    logger.warning(f"Page {page_num}: no text extracted")
+        
+        extracted_length = len(full_text.strip())
+        logger.info(f"Total text extracted: {extracted_length} characters from {len(pages_data)} pages")
+        
+        if extracted_length == 0:
+            logger.error("No text could be extracted from PDF")
+            raise ValueError("PDF appears to be empty or contains no extractable text")
+        
+        return pages_data, full_text.strip()
+    
+    except Exception as e:
+        logger.error(f"PDF indexed extraction error: {type(e).__name__}: {e}")
+        # Re-raise with appropriate HTTP exceptions (same as original function)
+        if isinstance(e, requests.exceptions.Timeout):
+            raise HTTPException(
+                status_code=status.HTTP_408_REQUEST_TIMEOUT,
+                detail="PDF download timed out - file may be too large"
+            )
+        elif isinstance(e, requests.exceptions.HTTPError):
+            if hasattr(e, 'response') and e.response.status_code == 404:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="PDF not found at the provided URL"
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Error downloading PDF: {str(e)}"
+                )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Error processing PDF: {str(e)}"
+            )
+
+def search_relevant_pages(pages_data: List[Dict], questions: List[str], max_pages_per_question: int = 3) -> Dict[str, List[Dict]]:
+    """
+    Search for pages most relevant to each question.
+    Returns: {question: [relevant_pages]}
+    """
+    logger.info(f"Searching relevant pages for {len(questions)} questions")
+    
+    question_pages = {}
+    
+    for question in questions:
+        logger.debug(f"Searching pages for question: {question[:100]}...")
+        
+        # Extract keywords from question
+        keywords = extract_keywords_from_question(question)
+        logger.debug(f"Extracted keywords: {keywords}")
+        
+        if not keywords:
+            # If no keywords, use first few pages as fallback
+            question_pages[question] = pages_data[:min(max_pages_per_question, len(pages_data))]
+            continue
+        
+        # Calculate relevance scores for all pages
+        page_scores = []
+        for page_data in pages_data:
+            score = calculate_page_relevance_score(page_data['text'], keywords)
+            if score > 0:  # Only include pages with some relevance
+                page_scores.append((score, page_data))
+        
+        # Sort by relevance score (descending) and take top pages
+        page_scores.sort(reverse=True, key=lambda x: x[0])
+        top_pages = [page_data for _, page_data in page_scores[:max_pages_per_question]]
+        
+        # If no relevant pages found, use first few pages as fallback
+        if not top_pages:
+            logger.warning(f"No relevant pages found for question, using fallback pages")
+            top_pages = pages_data[:min(max_pages_per_question, len(pages_data))]
+        
+        question_pages[question] = top_pages
+        
+        page_numbers = [p['page_number'] for p in top_pages]
+        logger.debug(f"Selected pages {page_numbers} for question")
+    
+    return question_pages
+
+def query_gemini_with_targeted_pages(question: str, relevant_pages: List[Dict]) -> str:
+    """Query Gemini with only the relevant pages for a specific question."""
+    
+    # Construct context from relevant pages
+    context_parts = []
+    for page_data in relevant_pages:
+        page_header = f"\n--- Page {page_data['page_number']} ---\n"
+        context_parts.append(page_header + page_data['text'])
+    
+    context = "\n".join(context_parts)
+    
+    # Construct the prompt
+    prompt = f"""Based on the following document pages, please answer the question.
+
+Document Content:
+{context}
+
+Question: {question}
+
+Please provide a clear and concise answer based on the information in the document pages above. If the answer cannot be found in the provided pages, please state that."""
+
+    # Query Gemini using similar logic to the batch function
+    logger.info(f"Querying Gemini for single question with targeted pages")
+    logger.debug(f"Context length: {len(context)} characters")
+    
+    max_rotation_attempts = len(key_manager.api_keys) * key_manager.max_retries_per_key
+    
+    for attempt in range(max_rotation_attempts):
+        current_key = key_manager.get_current_key()
+        url = f"{settings.GEMINI_BASE_URL}?key={current_key}"
+        headers = {"Content-Type": "application/json"}
+        
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": settings.GEMINI_TEMPERATURE,
+                "maxOutputTokens": settings.GEMINI_MAX_OUTPUT_TOKENS
+            }
+        }
+        
+        try:
+            logger.info(f"Sending targeted query to Gemini API (attempt {attempt + 1})...")
+            response = requests.post(
+                url, 
+                headers=headers, 
+                data=json.dumps(payload), 
+                timeout=settings.GEMINI_API_TIMEOUT
+            )
+            
+            # Handle key rotation on auth/rate limit errors
+            if response.status_code in [401, 403, 429]:
+                logger.warning(f"API error {response.status_code} with key, attempting rotation")
+                if key_manager.mark_key_failed(current_key):
+                    continue
+                else:
+                    break
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            # Reset key failures on success
+            key_manager.reset_key_failures(current_key)
+            
+            # Extract response
+            if "candidates" in result and len(result["candidates"]) > 0:
+                candidate = result["candidates"][0]
+                if "content" in candidate and "parts" in candidate["content"]:
+                    response_text = candidate["content"]["parts"][0]["text"].strip()
+                    logger.info(f"Generated targeted response length: {len(response_text)} characters")
+                    return response_text
+            
+            logger.error("Unexpected Gemini API response structure")
+            return "Error: Unable to process response from AI"
+            
+        except Exception as e:
+            logger.error(f"Error in targeted Gemini query (attempt {attempt + 1}): {e}")
+            if attempt == max_rotation_attempts - 1:
+                return f"Error: Failed to get response after {max_rotation_attempts} attempts"
+            
+            # Try with next key
+            if key_manager.mark_key_failed(current_key):
+                continue
+            else:
+                break
+    
+    return "Error: All API keys exhausted"
+
+def process_questions_with_targeted_search(pages_data: List[Dict], questions: List[str]) -> List[str]:
+    """Process questions using targeted page search for better accuracy."""
+    logger.info(f"Processing {len(questions)} questions with targeted search")
+    
+    # Find relevant pages for each question
+    question_pages = search_relevant_pages(pages_data, questions, max_pages_per_question=3)
+    
+    answers = []
+    for i, question in enumerate(questions):
+        logger.info(f"Processing question {i+1}/{len(questions)}")
+        
+        relevant_pages = question_pages[question]
+        page_numbers = [p['page_number'] for p in relevant_pages]
+        logger.info(f"Using pages {page_numbers} for question: {question[:100]}...")
+        
+        try:
+            answer = query_gemini_with_targeted_pages(question, relevant_pages)
+            answers.append(answer)
+            logger.info(f"Successfully answered question {i+1}")
+        except Exception as e:
+            logger.error(f"Error processing question {i+1}: {e}")
+            answers.append(f"Error processing question: {str(e)}")
+    
+    return answers
 
 def extract_pdf_text_from_url(pdf_url: str) -> str:
     """Download PDF from URL and extract text."""
@@ -577,22 +874,48 @@ async def process_pdf_questions(
     logger.debug(f"Questions: {request.questions}")
     
     try:
-        # Extract text from PDF
-        logger.info(f"Request {request_id}: Starting PDF text extraction")
-        pdf_content = extract_pdf_text_from_url(str(request.documents))
+        # Check if we should use targeted search based on settings
+        use_targeted_search = settings.USE_TARGETED_SEARCH
+        logger.info(f"Request {request_id}: Targeted search {'enabled' if use_targeted_search else 'disabled'}")
         
-        if not pdf_content:
-            logger.error(f"Request {request_id}: No text extracted from PDF")
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No text could be extracted from the PDF"
-            )
-        
-        logger.info(f"Request {request_id}: PDF text extraction successful, {len(pdf_content)} characters")
-        
-        # Process all questions in configurable batches
-        logger.info(f"Request {request_id}: Starting batch question processing with batch size {settings.GEMINI_BATCH_SIZE}")
-        answers = process_questions_in_batches(pdf_content, request.questions)
+        if use_targeted_search:
+            # Use enhanced extraction with page indexing
+            logger.info(f"Request {request_id}: Starting enhanced PDF extraction with page indexing")
+            pages_data, full_text = extract_pdf_with_page_indexing(str(request.documents))
+            
+            if not full_text:
+                logger.error(f"Request {request_id}: No text extracted from PDF")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No text could be extracted from the PDF"
+                )
+            
+            logger.info(f"Request {request_id}: Enhanced PDF extraction successful, {len(full_text)} characters from {len(pages_data)} pages")
+            
+            # Check if PDF is large enough to benefit from targeted search
+            if len(full_text) > settings.LARGE_PDF_THRESHOLD:
+                logger.info(f"Request {request_id}: Large PDF detected ({len(full_text)} chars > {settings.LARGE_PDF_THRESHOLD}), using targeted search")
+                answers = process_questions_with_targeted_search(pages_data, request.questions)
+            else:
+                logger.info(f"Request {request_id}: Small PDF, using standard batch processing")
+                answers = process_questions_in_batches(full_text, request.questions)
+        else:
+            # Use standard extraction and processing
+            logger.info(f"Request {request_id}: Starting standard PDF text extraction")
+            pdf_content = extract_pdf_text_from_url(str(request.documents))
+            
+            if not pdf_content:
+                logger.error(f"Request {request_id}: No text extracted from PDF")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No text could be extracted from the PDF"
+                )
+            
+            logger.info(f"Request {request_id}: Standard PDF text extraction successful, {len(pdf_content)} characters")
+            
+            # Process all questions in configurable batches
+            logger.info(f"Request {request_id}: Starting batch question processing with batch size {settings.GEMINI_BATCH_SIZE}")
+            answers = process_questions_in_batches(pdf_content, request.questions)
         
         logger.info(f"Request {request_id}: Successfully processed all questions, returning {len(answers)} answers")
         logger.debug(f"Request {request_id}: Answers: {answers}")

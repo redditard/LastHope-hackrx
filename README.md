@@ -43,7 +43,33 @@ GEMINI_BATCH_SIZE=10
 # Key rotation settings
 GEMINI_KEY_ROTATION_ENABLED=true
 GEMINI_MAX_RETRIES_PER_KEY=2
+
+# Targeted search settings for large PDFs
+USE_TARGETED_SEARCH=true
+MAX_PAGES_PER_QUESTION=3
+LARGE_PDF_THRESHOLD=50000
 ```
+
+## 🎯 **Smart PDF Processing Features**
+
+### **Targeted Page Search**
+For large PDFs, the application automatically switches to a smart search mode that:
+
+1. **Keyword Extraction** - Analyzes each question to extract meaningful keywords
+2. **Page Scoring** - Scores each PDF page based on keyword relevance
+3. **Selective Processing** - Sends only the most relevant pages to Gemini AI
+4. **Improved Accuracy** - Better answers by focusing on relevant content
+5. **Token Efficiency** - Reduces API costs by processing less text
+
+**Configuration Options:**
+- `USE_TARGETED_SEARCH` - Enable/disable smart search (default: true)
+- `MAX_PAGES_PER_QUESTION` - Maximum pages to analyze per question (default: 3)
+- `LARGE_PDF_THRESHOLD` - Character count threshold to trigger smart search (default: 50,000)
+
+**How it works:**
+- PDFs under 50,000 characters: Standard batch processing
+- PDFs over 50,000 characters: Targeted page search for better accuracy
+- Each question gets analyzed separately for maximum relevance
 
 ### 3. Get Gemini API Key
 
